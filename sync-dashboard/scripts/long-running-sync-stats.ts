@@ -513,7 +513,7 @@ async function runTest() {
         `\r[${new Date().toISOString()}] Blk:${directBlock} Drift:${drift} Reads:${status} Batch:${batchStatus} D:${directLatencyMs.toFixed(1)}ms R:${refLatencyMs.toFixed(1)}ms Mem:${memory.heapUsedMB}MB    `
       );
 
-      await sleep(500);
+      await sleep(5000); // 5 seconds between iterations
     } catch (error) {
       console.error("\nError:", error);
       await sleep(5000);
