@@ -9,7 +9,9 @@
     "test": "tsx scripts/long-running-sync-stats.ts"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "@direct.dev/client": "^0.7.2",
+    "express": "^4.19.2",
+    "viem": "^2.23.0"
   },
   "devDependencies": {
     "tsx": "^4.21.0"
