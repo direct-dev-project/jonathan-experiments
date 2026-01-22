@@ -1,16 +1,12 @@
 /**
- * Long-running E2E Sync Statistics Test
+ * Long-Running Sync Test with Statistical Data Collection
  * 
- * Compares Direct (via @direct.dev/viem) vs reference node for:
- * - Block sync (drift)
- * - Read latency
- * - Data consistency (reads match)
- * 
- * Outputs NDJSON to DATA_FILE env var or /tmp/e2e-sync-data.ndjson
+ * Uses @direct.dev/client directly (not viem wrapper)
+ * Compares Direct vs reference node for drift, latency, and data consistency.
  */
 
-import createDirectClient from "@direct.dev/viem";
-import { createPublicClient, http, type PublicClient } from "viem";
+import { makeDirectRPCClient } from "@direct.dev/client";
+import { createPublicClient, http } from "viem";
 import { mainnet } from "viem/chains";
 import { appendFileSync, existsSync, mkdirSync } from "fs";
 import { dirname } from "path";
@@ -24,32 +20,14 @@ if (!PROJECT_ID || !PROJECT_TOKEN) {
 }
 
 const REFERENCE_RPC = "https://eth.llamarpc.com";
-
 const DATA_FILE = process.env.DATA_FILE || "/tmp/e2e-sync-data.ndjson";
 const MISMATCH_FILE = DATA_FILE.replace(/\.ndjson$/, "-mismatches.ndjson");
 
-// Test addresses for read comparison
 const TEST_ADDRESSES = [
   "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
   "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC
   "0xdAC17F958D2ee523a2206206994597C13D831ec7", // USDT
-] as const;
-
-interface SyncDataPoint {
-  timestamp: number;
-  isoTime: string;
-  directBlock: number;
-  referenceBlock: number;
-  drift: number;
-  directLatencyMs: number;
-  referenceLatencyMs: number;
-  readsMatched: boolean;
-  readCount: number;
-  directBlockDeltaMs: number | null;
-  refBlockDeltaMs: number | null;
-  directBlockJump: number;
-  refBlockJump: number;
-}
+];
 
 interface MismatchDump {
   timestamp: number;
@@ -74,92 +52,23 @@ function appendData(file: string, data: object) {
   appendFileSync(file, JSON.stringify(data) + "\n");
 }
 
-async function measureLatency<T>(
-  fn: () => Promise<T>
-): Promise<{ result: T; latencyMs: number }> {
-  const start = performance.now();
-  const result = await fn();
-  const latencyMs = performance.now() - start;
-  return { result, latencyMs };
-}
-
-async function getBalanceWithError(
-  client: PublicClient,
-  address: `0x${string}`,
-  blockNumber: bigint
-): Promise<{ balance: string | null; error?: string }> {
-  try {
-    const balance = await client.getBalance({ address, blockNumber });
-    return { balance: balance.toString() };
-  } catch (e) {
-    return { balance: null, error: e instanceof Error ? e.message : String(e) };
-  }
-}
-
-async function compareReads(
-  direct: PublicClient,
-  reference: PublicClient,
-  blockNumber: bigint
-): Promise<{ matched: boolean; count: number; mismatches: MismatchDump[] }> {
-  const mismatches: MismatchDump[] = [];
-  let matchCount = 0;
-
-  for (const address of TEST_ADDRESSES) {
-    const [directResult, refResult] = await Promise.all([
-      getBalanceWithError(direct, address, blockNumber),
-      getBalanceWithError(reference, address, blockNumber),
-    ]);
-
-    if (directResult.balance === refResult.balance && !directResult.error && !refResult.error) {
-      matchCount++;
-    } else {
-      // Dump mismatch details
-      const mismatch: MismatchDump = {
-        timestamp: Date.now(),
-        isoTime: new Date().toISOString(),
-        block: Number(blockNumber),
-        address,
-        directValue: directResult.balance,
-        referenceValue: refResult.balance,
-      };
-      if (directResult.error) mismatch.directError = directResult.error;
-      if (refResult.error) mismatch.referenceError = refResult.error;
-      
-      mismatches.push(mismatch);
-      
-      // Log to console immediately
-      console.error(`\n⚠️  MISMATCH at block ${blockNumber} for ${address}:`);
-      console.error(`   Direct:    ${directResult.balance ?? `ERROR: ${directResult.error}`}`);
-      console.error(`   Reference: ${refResult.balance ?? `ERROR: ${refResult.error}`}`);
-    }
-  }
-
-  return {
-    matched: mismatches.length === 0,
-    count: TEST_ADDRESSES.length,
-    mismatches,
-  };
-}
-
 async function runTest() {
-  console.log("Starting long-running sync statistics test...");
+  console.log("Starting long-running sync test (using @direct.dev/client)...");
   console.log(`Project ID: ${PROJECT_ID}`);
   console.log(`Reference RPC: ${REFERENCE_RPC}`);
   console.log(`Data file: ${DATA_FILE}`);
   console.log(`Mismatch file: ${MISMATCH_FILE}`);
   console.log("");
 
-  // Create Direct client using the SDK
-  const direct = createDirectClient(
-    {
-      projectId: PROJECT_ID!,
-      projectToken: PROJECT_TOKEN!,
-    },
-    mainnet
-  );
+  // Create Direct client using the SDK directly
+  const directClient = makeDirectRPCClient({
+    projectId: PROJECT_ID!,
+    projectToken: PROJECT_TOKEN!,
+    networkId: "ethereum",
+  });
 
   // Create reference client using vanilla viem
-  const reference = createPublicClient({
+  const referenceClient = createPublicClient({
     chain: mainnet,
     transport: http(REFERENCE_RPC),
   });
@@ -174,22 +83,73 @@ async function runTest() {
       const now = Date.now();
 
       // Get block numbers with latency measurement
-      const [directBlockResult, refBlockResult] = await Promise.all([
-        measureLatency(() => direct.getBlockNumber()),
-        measureLatency(() => reference.getBlockNumber()),
-      ]);
+      const directStart = performance.now();
+      const directBlockResponse = await directClient.fetch({ jsonrpc: "2.0", id: 1, method: "eth_blockNumber" });
+      const directLatencyMs = performance.now() - directStart;
+      const directBlock = Number((directBlockResponse as any).result);
 
-      const directBlock = Number(directBlockResult.result);
-      const refBlock = Number(refBlockResult.result);
+      const refStart = performance.now();
+      const refBlockBigInt = await referenceClient.getBlockNumber();
+      const refLatencyMs = performance.now() - refStart;
+      const refBlock = Number(refBlockBigInt);
+
       const drift = directBlock - refBlock;
 
-      // Compare reads at the lower block number (both should have it)
-      const compareBlock = BigInt(Math.min(directBlock, refBlock));
-      const readComparison = await compareReads(direct, reference, compareBlock);
+      // Compare reads at the lower block number
+      const compareBlock = Math.min(directBlock, refBlock);
+      const compareBlockHex = "0x" + compareBlock.toString(16);
+      
+      let readsMatched = true;
+      const mismatches: MismatchDump[] = [];
 
-      // Dump any mismatches to separate file
-      for (const mismatch of readComparison.mismatches) {
-        appendData(MISMATCH_FILE, mismatch);
+      for (const address of TEST_ADDRESSES) {
+        let directBalance: string | null = null;
+        let refBalance: string | null = null;
+        let directError: string | undefined;
+        let refError: string | undefined;
+
+        try {
+          const response = await directClient.fetch({
+            jsonrpc: "2.0",
+            id: Date.now(),
+            method: "eth_getBalance",
+            params: [address, compareBlockHex],
+          });
+          directBalance = String(BigInt((response as any).result));
+        } catch (e) {
+          directError = e instanceof Error ? e.message : String(e);
+        }
+
+        try {
+          const result = await referenceClient.getBalance({
+            address: address as `0x${string}`,
+            blockNumber: BigInt(compareBlock),
+          });
+          refBalance = result.toString();
+        } catch (e) {
+          refError = e instanceof Error ? e.message : String(e);
+        }
+
+        if (directBalance !== refBalance || directError || refError) {
+          readsMatched = false;
+          const mismatch: MismatchDump = {
+            timestamp: Date.now(),
+            isoTime: new Date().toISOString(),
+            block: compareBlock,
+            address,
+            directValue: directBalance,
+            referenceValue: refBalance,
+          };
+          if (directError) mismatch.directError = directError;
+          if (refError) mismatch.referenceError = refError;
+          
+          mismatches.push(mismatch);
+          appendData(MISMATCH_FILE, mismatch);
+          
+          console.error(`\n⚠️  MISMATCH at block ${compareBlock} for ${address}:`);
+          console.error(`   Direct:    ${directBalance ?? `ERROR: ${directError}`}`);
+          console.error(`   Reference: ${refBalance ?? `ERROR: ${refError}`}`);
+        }
       }
 
       // Calculate block deltas
@@ -212,16 +172,16 @@ async function runTest() {
         }
       }
 
-      const dataPoint: SyncDataPoint = {
+      const dataPoint = {
         timestamp: now,
         isoTime: new Date(now).toISOString(),
         directBlock,
         referenceBlock: refBlock,
         drift,
-        directLatencyMs: directBlockResult.latencyMs,
-        referenceLatencyMs: refBlockResult.latencyMs,
-        readsMatched: readComparison.matched,
-        readCount: readComparison.count,
+        directLatencyMs,
+        referenceLatencyMs: refLatencyMs,
+        readsMatched,
+        readCount: TEST_ADDRESSES.length,
         directBlockDeltaMs,
         refBlockDeltaMs,
         directBlockJump,
@@ -241,12 +201,11 @@ async function runTest() {
       }
 
       // Status output
-      const status = readComparison.matched ? "✓" : "✗";
+      const status = readsMatched ? "✓" : "✗";
       process.stdout.write(
-        `\r[${new Date().toISOString()}] Direct: ${directBlock} | Ref: ${refBlock} | Drift: ${drift} | Reads: ${status} | Direct: ${directBlockResult.latencyMs.toFixed(2)}ms | Ref: ${refBlockResult.latencyMs.toFixed(2)}ms    `
+        `\r[${new Date().toISOString()}] Direct: ${directBlock} | Ref: ${refBlock} | Drift: ${drift} | Reads: ${status} | Direct: ${directLatencyMs.toFixed(2)}ms | Ref: ${refLatencyMs.toFixed(2)}ms    `
       );
 
-      // Wait before next iteration
       await new Promise((resolve) => setTimeout(resolve, 500));
     } catch (error) {
       console.error("\nError during test iteration:", error);
