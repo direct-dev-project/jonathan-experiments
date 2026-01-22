@@ -28,24 +28,28 @@ function buildCharts() {
   batchChart = new Chart(document.getElementById("batchChart"), chartOpts("Batch (ms)", "#f472b6"));
 }
 
+const MAX_CHART_POINTS = 200; // Sliding window for charts
+
 function updateCharts(points) {
-  const labels = points.map(p => p.isoTime?.slice(11, 19) || "");
+  // Use only last N points for charts to prevent memory bloat
+  const chartPoints = points.slice(-MAX_CHART_POINTS);
+  const labels = chartPoints.map(p => p.isoTime?.slice(11, 19) || "");
   
   driftChart.data.labels = labels;
-  driftChart.data.datasets[0].data = points.map(p => p.drift ?? null);
+  driftChart.data.datasets[0].data = chartPoints.map(p => p.drift ?? null);
   driftChart.update();
 
   latencyChart.data.labels = labels;
-  latencyChart.data.datasets[0].data = points.map(p => p.directLatencyMs ?? null);
-  latencyChart.data.datasets[1].data = points.map(p => p.referenceLatencyMs ?? null);
+  latencyChart.data.datasets[0].data = chartPoints.map(p => p.directLatencyMs ?? null);
+  latencyChart.data.datasets[1].data = chartPoints.map(p => p.referenceLatencyMs ?? null);
   latencyChart.update();
 
   memoryChart.data.labels = labels;
-  memoryChart.data.datasets[0].data = points.map(p => p.heapUsedMB ?? null);
+  memoryChart.data.datasets[0].data = chartPoints.map(p => p.heapUsedMB ?? null);
   memoryChart.update();
 
   batchChart.data.labels = labels;
-  batchChart.data.datasets[0].data = points.map(p => p.directBatchLatencyMs ?? null);
+  batchChart.data.datasets[0].data = chartPoints.map(p => p.directBatchLatencyMs ?? null);
   batchChart.update();
 }
 

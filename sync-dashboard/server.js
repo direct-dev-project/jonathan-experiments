@@ -140,13 +140,16 @@ function computeMismatchStats(mismatches, recoveries) {
   };
 }
 
+const MAX_POINTS_TO_CLIENT = 500; // Limit data sent to client
+
 app.get("/api/stats", (req, res) => {
   fs.readFile(DATA_PATH, "utf8", (err, raw) => {
     if (err) return res.status(500).json({ error: "Failed to read data" });
     
     try {
-      const points = parseNdjson(raw).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-      const stats = computeStats(points);
+      const allPoints = parseNdjson(raw).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      const stats = computeStats(allPoints); // Stats from ALL data
+      const points = allPoints.slice(-MAX_POINTS_TO_CLIENT); // But only send last N to client
       const mismatches = safeReadNdjson(MISMATCH_PATH);
       const recoveries = safeReadNdjson(RECOVERY_PATH);
       const mismatchStats = computeMismatchStats(mismatches, recoveries);
