@@ -1,13 +1,11 @@
 /**
  * Long-Running Sync Test with Statistical Data Collection
  * 
- * Uses @direct.dev/client directly (not viem wrapper)
+ * Uses @direct.dev/client for Direct, raw fetch for reference (no caching).
  * Compares Direct vs reference node for drift, latency, and data consistency.
  */
 
 import { makeDirectRPCClient } from "@direct.dev/client";
-import { createPublicClient, http } from "viem";
-import { mainnet } from "viem/chains";
 import { appendFileSync, existsSync, mkdirSync } from "fs";
 import { dirname } from "path";
 
@@ -52,25 +50,46 @@ function appendData(file: string, data: object) {
   appendFileSync(file, JSON.stringify(data) + "\n");
 }
 
+let rpcId = 1;
+
+// Raw fetch for reference RPC (no caching)
+async function refRpcCall(method: string, params?: unknown[]): Promise<unknown> {
+  const response = await fetch(REFERENCE_RPC, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: rpcId++,
+      method,
+      params,
+    }),
+  });
+  
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+  }
+  
+  const json = await response.json();
+  if (json.error) {
+    throw new Error(json.error.message);
+  }
+  
+  return json.result;
+}
+
 async function runTest() {
-  console.log("Starting long-running sync test (using @direct.dev/client)...");
-  console.log(`Project ID: ${PROJECT_ID}`);
-  console.log(`Reference RPC: ${REFERENCE_RPC}`);
+  console.log("Starting long-running sync test...");
+  console.log(`Direct: @direct.dev/client`);
+  console.log(`Reference: raw fetch to ${REFERENCE_RPC}`);
   console.log(`Data file: ${DATA_FILE}`);
   console.log(`Mismatch file: ${MISMATCH_FILE}`);
   console.log("");
 
-  // Create Direct client using the SDK directly
+  // Create Direct client using the SDK
   const directClient = makeDirectRPCClient({
     projectId: PROJECT_ID!,
     projectToken: PROJECT_TOKEN!,
     networkId: "ethereum",
-  });
-
-  // Create reference client using vanilla viem
-  const referenceClient = createPublicClient({
-    chain: mainnet,
-    transport: http(REFERENCE_RPC),
   });
 
   let lastDirectBlock: number | null = null;
@@ -89,9 +108,9 @@ async function runTest() {
       const directBlock = Number((directBlockResponse as any).result);
 
       const refStart = performance.now();
-      const refBlockBigInt = await referenceClient.getBlockNumber();
+      const refBlockHex = await refRpcCall("eth_blockNumber");
       const refLatencyMs = performance.now() - refStart;
-      const refBlock = Number(refBlockBigInt);
+      const refBlock = Number(refBlockHex);
 
       const drift = directBlock - refBlock;
 
@@ -121,11 +140,8 @@ async function runTest() {
         }
 
         try {
-          const result = await referenceClient.getBalance({
-            address: address as `0x${string}`,
-            blockNumber: BigInt(compareBlock),
-          });
-          refBalance = result.toString();
+          const result = await refRpcCall("eth_getBalance", [address, compareBlockHex]);
+          refBalance = String(BigInt(result as string));
         } catch (e) {
           refError = e instanceof Error ? e.message : String(e);
         }
