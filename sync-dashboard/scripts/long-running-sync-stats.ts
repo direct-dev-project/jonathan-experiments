@@ -1,7 +1,7 @@
 /**
  * Long-running E2E Sync Statistics Test
  * 
- * Compares Direct vs reference node for:
+ * Compares Direct (via @direct.dev/viem) vs reference node for:
  * - Block sync (drift)
  * - Read latency
  * - Data consistency (reads match)
@@ -9,12 +9,20 @@
  * Outputs NDJSON to DATA_FILE env var or /tmp/e2e-sync-data.ndjson
  */
 
+import createDirectClient from "@direct.dev/viem";
 import { createPublicClient, http, type PublicClient } from "viem";
 import { mainnet } from "viem/chains";
 import { appendFileSync, existsSync, mkdirSync } from "fs";
 import { dirname } from "path";
 
-const DIRECT_RPC = `https://rpc.direct.dev/v2/${process.env.DIRECT_PROJECT_ID}?token=${process.env.DIRECT_PROJECT_TOKEN}`;
+const PROJECT_ID = process.env.DIRECT_PROJECT_ID;
+const PROJECT_TOKEN = process.env.DIRECT_PROJECT_TOKEN;
+
+if (!PROJECT_ID || !PROJECT_TOKEN) {
+  console.error("Error: DIRECT_PROJECT_ID and DIRECT_PROJECT_TOKEN must be set");
+  process.exit(1);
+}
+
 const REFERENCE_RPC = "https://eth.llamarpc.com";
 
 const DATA_FILE = process.env.DATA_FILE || "/tmp/e2e-sync-data.ndjson";
@@ -64,23 +72,6 @@ function ensureDir(filePath: string) {
 function appendData(file: string, data: object) {
   ensureDir(file);
   appendFileSync(file, JSON.stringify(data) + "\n");
-}
-
-async function createClients(): Promise<{
-  direct: PublicClient;
-  reference: PublicClient;
-}> {
-  const direct = createPublicClient({
-    chain: mainnet,
-    transport: http(DIRECT_RPC),
-  });
-
-  const reference = createPublicClient({
-    chain: mainnet,
-    transport: http(REFERENCE_RPC),
-  });
-
-  return { direct, reference };
 }
 
 async function measureLatency<T>(
@@ -152,13 +143,26 @@ async function compareReads(
 
 async function runTest() {
   console.log("Starting long-running sync statistics test...");
-  console.log(`Direct RPC: ${DIRECT_RPC.replace(/token=.*/, "token=***")}`);
+  console.log(`Project ID: ${PROJECT_ID}`);
   console.log(`Reference RPC: ${REFERENCE_RPC}`);
   console.log(`Data file: ${DATA_FILE}`);
   console.log(`Mismatch file: ${MISMATCH_FILE}`);
   console.log("");
 
-  const { direct, reference } = await createClients();
+  // Create Direct client using the SDK
+  const direct = createDirectClient(
+    {
+      projectId: PROJECT_ID!,
+      projectToken: PROJECT_TOKEN!,
+    },
+    mainnet
+  );
+
+  // Create reference client using vanilla viem
+  const reference = createPublicClient({
+    chain: mainnet,
+    transport: http(REFERENCE_RPC),
+  });
 
   let lastDirectBlock: number | null = null;
   let lastRefBlock: number | null = null;
