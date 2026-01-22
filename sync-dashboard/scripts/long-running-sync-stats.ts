@@ -8,6 +8,7 @@
  * - eth_blockNumber: block sync
  * - eth_getBalance: balance reads
  * - eth_call: Chainlink ETH/USD price feed
+ * - eth_getLogs: USDC Transfer events (log filtering vs state reads)
  * - Batch requests: ordering and performance
  * - Memory tracking: detect leaks over time
  */
@@ -40,6 +41,10 @@ const TEST_ADDRESSES = [
 // Chainlink ETH/USD Price Feed on mainnet
 const CHAINLINK_ETH_USD = "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419";
 const LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c";
+
+// USDC Transfer event topic (keccak256("Transfer(address,address,uint256)"))
+const USDC_ADDRESS = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
 // Additional test address for batch
 const VITALIK = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
@@ -201,7 +206,7 @@ async function runTest() {
   console.log(`Direct: @direct.dev/client`);
   console.log(`Reference: raw fetch to ${REFERENCE_RPC.split('/')[2]}`);
   console.log(`Data file: ${DATA_FILE}`);
-  console.log(`Tests: eth_blockNumber, eth_getBalance (${TEST_ADDRESSES.length}), eth_call, BATCH requests`);
+  console.log(`Tests: eth_blockNumber, eth_getBalance (${TEST_ADDRESSES.length}), eth_call, eth_getLogs (USDC), BATCH requests`);
   console.log(`Memory tracking: enabled`);
   console.log("");
 
@@ -330,6 +335,103 @@ async function runTest() {
       }
 
       if (directCallResult && refCallResult && directCallResult !== refCallResult) {
+        readsMatched = false;
+      }
+
+      // ============ eth_getLogs TEST (USDC Transfers) ============
+      const logsParams = {
+        address: USDC_ADDRESS,
+        topics: [TRANSFER_TOPIC],
+        fromBlock: compareBlockHex,
+        toBlock: compareBlockHex,
+      };
+      
+      let directLogs: any[] | null = null;
+      let refLogs: any[] | null = null;
+      let directLogsLatencyMs = 0;
+      let refLogsLatencyMs = 0;
+      let logsMatched = true;
+
+      try {
+        const logsStart = performance.now();
+        const response = await directClient.fetch({
+          jsonrpc: "2.0",
+          id: Date.now(),
+          method: "eth_getLogs",
+          params: [logsParams],
+        });
+        directLogsLatencyMs = performance.now() - logsStart;
+        directLogs = (response as any).result;
+      } catch (e) {
+        directErrors++;
+        appendData(ERROR_FILE, {
+          timestamp: Date.now(),
+          isoTime: new Date().toISOString(),
+          block: compareBlock,
+          type: "logs",
+          source: "direct",
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+
+      const refLogsStart = performance.now();
+      const refLogsRes = await refRpcCall("eth_getLogs", [logsParams]);
+      refLogsLatencyMs = performance.now() - refLogsStart;
+      
+      if (!refLogsRes.error) {
+        refLogs = refLogsRes.result as any[];
+      } else {
+        refErrors++;
+        appendData(ERROR_FILE, {
+          timestamp: Date.now(),
+          isoTime: new Date().toISOString(),
+          block: compareBlock,
+          type: "logs",
+          source: "reference",
+          error: refLogsRes.error,
+        });
+      }
+
+      // Compare logs: count and content
+      if (directLogs !== null && refLogs !== null) {
+        if (directLogs.length !== refLogs.length) {
+          logsMatched = false;
+          const mismatchId = `M${++mismatchCounter}`;
+          appendData(MISMATCH_FILE, {
+            timestamp: Date.now(),
+            isoTime: new Date().toISOString(),
+            mismatchId,
+            block: compareBlock,
+            type: "logs",
+            directLogCount: directLogs.length,
+            refLogCount: refLogs.length,
+          });
+          console.error(`\n⚠️  MISMATCH [${mismatchId}] logs count at block ${compareBlock}: Direct=${directLogs.length} Ref=${refLogs.length}`);
+        } else {
+          // Compare log entries by transactionHash + logIndex
+          const directSet = new Set(directLogs.map((l: any) => `${l.transactionHash}:${l.logIndex}`));
+          const refSet = new Set(refLogs.map((l: any) => `${l.transactionHash}:${l.logIndex}`));
+          
+          for (const key of refSet) {
+            if (!directSet.has(key)) {
+              logsMatched = false;
+              const mismatchId = `M${++mismatchCounter}`;
+              appendData(MISMATCH_FILE, {
+                timestamp: Date.now(),
+                isoTime: new Date().toISOString(),
+                mismatchId,
+                block: compareBlock,
+                type: "logs",
+                missingInDirect: key,
+              });
+              console.error(`\n⚠️  MISMATCH [${mismatchId}] logs content at block ${compareBlock}: missing ${key}`);
+              break;
+            }
+          }
+        }
+      }
+
+      if (!logsMatched) {
         readsMatched = false;
       }
 
@@ -478,6 +580,11 @@ async function runTest() {
         readCount: TEST_ADDRESSES.length + 1,
         directErrors,
         refErrors,
+        // Logs metrics
+        directLogsLatencyMs,
+        refLogsLatencyMs,
+        logsMatched,
+        logCount: directLogs?.length ?? 0,
         // Batch metrics
         batchSize: batchRequests.length,
         directBatchLatencyMs,
@@ -509,8 +616,9 @@ async function runTest() {
       // Status output
       const status = readsMatched ? "✓" : "✗";
       const batchStatus = directBatchOrdered && batchMatched ? "✓" : "✗";
+      const logsStatus = logsMatched ? "✓" : "✗";
       process.stdout.write(
-        `\r[${new Date().toISOString()}] Blk:${directBlock} Drift:${drift} Reads:${status} Batch:${batchStatus} D:${directLatencyMs.toFixed(1)}ms R:${refLatencyMs.toFixed(1)}ms Mem:${memory.heapUsedMB}MB    `
+        `\r[${new Date().toISOString()}] Blk:${directBlock} Drift:${drift} Reads:${status} Logs:${logsStatus}(${directLogs?.length ?? 0}) Batch:${batchStatus} D:${directLatencyMs.toFixed(1)}ms R:${refLatencyMs.toFixed(1)}ms Mem:${memory.heapUsedMB}MB    `
       );
 
       await sleep(5000); // 5 seconds between iterations
