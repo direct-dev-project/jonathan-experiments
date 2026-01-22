@@ -37,6 +37,24 @@
         </div>
       </section>
 
+      <section class="metrics">
+        <div class="metric-card">
+          <p class="metric-label">Total Mismatches</p>
+          <div class="metric-value" id="totalMismatches">--</div>
+          <p class="metric-sub">Detected read/call differences</p>
+        </div>
+        <div class="metric-card">
+          <p class="metric-label">Recovered (Ref Hiccups)</p>
+          <div class="metric-value" id="recoveredMismatches">--</div>
+          <p class="metric-sub">Matched on 5s retry</p>
+        </div>
+        <div class="metric-card">
+          <p class="metric-label">Persistent (Potential Bugs)</p>
+          <div class="metric-value" id="persistentMismatches">--</div>
+          <p class="metric-sub">Still mismatched after retry</p>
+        </div>
+      </section>
+
       <section class="charts">
         <div class="panel">
           <div class="panel-header">
@@ -72,6 +90,28 @@
               </tr>
             </thead>
             <tbody id="dataTable"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="table-panel">
+        <div class="panel-header">
+          <h2>Recent Mismatches</h2>
+          <p>Detected differences with retry status.</p>
+        </div>
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Time</th>
+                <th>Type</th>
+                <th>Block</th>
+                <th>Address</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="mismatchTable"></tbody>
           </table>
         </div>
       </section>

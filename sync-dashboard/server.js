@@ -6,6 +6,8 @@ const path = require("path");
 
 const PORT = 3000;
 const DATA_PATH = "/tmp/e2e-sync-data.ndjson";
+const MISMATCH_PATH = "/tmp/e2e-sync-data-mismatches.ndjson";
+const RECOVERY_PATH = "/tmp/e2e-sync-data-recoveries.ndjson";
 
 const app = express();
 
@@ -32,6 +34,16 @@ function parseNdjson(raw) {
     }
   }
   return data;
+}
+
+function safeReadNdjson(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return [];
+    const raw = fs.readFileSync(filePath, "utf8");
+    return parseNdjson(raw);
+  } catch (err) {
+    return [];
+  }
 }
 
 function percentile(sorted, p) {
@@ -119,6 +131,40 @@ function computeStats(points) {
   };
 }
 
+function computeMismatchStats(mismatches, recoveries) {
+  const totalMismatches = mismatches.length;
+  
+  // Build a map of recoveries by mismatchId
+  const recoveryMap = new Map();
+  for (const r of recoveries) {
+    recoveryMap.set(r.mismatchId, r);
+  }
+  
+  let recoveredCount = 0;
+  let persistentCount = 0;
+  let pendingCount = 0;
+  
+  for (const m of mismatches) {
+    const recovery = recoveryMap.get(m.mismatchId);
+    if (!recovery) {
+      pendingCount++;
+    } else if (recovery.recovered) {
+      recoveredCount++;
+    } else {
+      persistentCount++;
+    }
+  }
+  
+  return {
+    total: totalMismatches,
+    recovered: recoveredCount,      // Reference hiccups
+    persistent: persistentCount,    // Potential Direct bugs
+    pending: pendingCount,          // Awaiting retry result
+    mismatches: mismatches.slice(-20), // Last 20 mismatches
+    recoveries: recoveries.slice(-20)  // Last 20 recoveries
+  };
+}
+
 app.get("/api/stats", (req, res) => {
   fs.readFile(DATA_PATH, "utf8", (err, raw) => {
     if (err) {
@@ -142,10 +188,16 @@ app.get("/api/stats", (req, res) => {
 
     points.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
     const stats = computeStats(points);
+    
+    // Load mismatch and recovery data
+    const mismatches = safeReadNdjson(MISMATCH_PATH);
+    const recoveries = safeReadNdjson(RECOVERY_PATH);
+    const mismatchStats = computeMismatchStats(mismatches, recoveries);
 
     res.json({
       points,
-      stats
+      stats,
+      mismatchStats
     });
   });
 });

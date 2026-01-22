@@ -8,6 +8,11 @@
  * - eth_blockNumber: block sync
  * - eth_getBalance: balance reads
  * - eth_call: Chainlink ETH/USD price feed
+ * 
+ * Mismatch handling:
+ * - Log mismatch immediately
+ * - Retry reference after 5s (non-blocking) to check if it was a ref hiccup
+ * - Log recovery separately for dashboard metrics
  */
 
 import { makeDirectRPCClient } from "@direct.dev/client";
@@ -25,6 +30,7 @@ if (!PROJECT_ID || !PROJECT_TOKEN) {
 const REFERENCE_RPC = "https://eth.llamarpc.com";
 const DATA_FILE = process.env.DATA_FILE || "/tmp/e2e-sync-data.ndjson";
 const MISMATCH_FILE = DATA_FILE.replace(/\.ndjson$/, "-mismatches.ndjson");
+const RECOVERY_FILE = DATA_FILE.replace(/\.ndjson$/, "-recoveries.ndjson");
 
 // Test addresses for eth_getBalance
 const TEST_ADDRESSES = [
@@ -41,6 +47,7 @@ const LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c";
 interface MismatchDump {
   timestamp: number;
   isoTime: string;
+  mismatchId: string;
   block: number;
   type: "balance" | "call";
   address: string;
@@ -48,9 +55,19 @@ interface MismatchDump {
   referenceValue: string | null;
   directError?: string;
   referenceError?: string;
-  retriedAfter5s?: boolean;
-  retryMatched?: boolean;
-  retryReferenceValue?: string | null;
+}
+
+interface RecoveryDump {
+  timestamp: number;
+  isoTime: string;
+  mismatchId: string;
+  block: number;
+  type: "balance" | "call";
+  address: string;
+  recovered: boolean;
+  directValue: string | null;
+  originalRefValue: string | null;
+  retryRefValue: string | null;
 }
 
 function ensureDir(filePath: string) {
@@ -66,6 +83,7 @@ function appendData(file: string, data: object) {
 }
 
 let rpcId = 1;
+let mismatchCounter = 0;
 
 // Raw fetch for reference RPC (no caching)
 async function refRpcCall(method: string, params?: unknown[]): Promise<unknown> {
@@ -96,12 +114,57 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Schedule a non-blocking retry for mismatch verification
+function scheduleRetry(
+  mismatchId: string,
+  block: number,
+  type: "balance" | "call",
+  address: string,
+  directValue: string | null,
+  originalRefValue: string | null,
+  retryFn: () => Promise<string | null>
+) {
+  sleep(5000).then(async () => {
+    let retryRefValue: string | null = null;
+    let recovered = false;
+    
+    try {
+      retryRefValue = await retryFn();
+      recovered = directValue === retryRefValue;
+    } catch (e) {
+      // Retry failed
+    }
+
+    const recovery: RecoveryDump = {
+      timestamp: Date.now(),
+      isoTime: new Date().toISOString(),
+      mismatchId,
+      block,
+      type,
+      address,
+      recovered,
+      directValue,
+      originalRefValue,
+      retryRefValue,
+    };
+    
+    appendData(RECOVERY_FILE, recovery);
+    
+    if (recovered) {
+      console.error(`\n✅ RECOVERY [${mismatchId}]: ${type} at block ${block} - reference hiccup confirmed`);
+    } else {
+      console.error(`\n❌ PERSISTENT [${mismatchId}]: ${type} at block ${block} - mismatch still present after retry`);
+    }
+  });
+}
+
 async function runTest() {
   console.log("Starting long-running sync test...");
   console.log(`Direct: @direct.dev/client`);
   console.log(`Reference: raw fetch to ${REFERENCE_RPC}`);
   console.log(`Data file: ${DATA_FILE}`);
   console.log(`Mismatch file: ${MISMATCH_FILE}`);
+  console.log(`Recovery file: ${RECOVERY_FILE}`);
   console.log(`Tests: eth_blockNumber, eth_getBalance (${TEST_ADDRESSES.length}), eth_call (Chainlink ETH/USD)`);
   console.log("");
 
@@ -139,7 +202,6 @@ async function runTest() {
       const compareBlockHex = "0x" + compareBlock.toString(16);
       
       let readsMatched = true;
-      const mismatches: MismatchDump[] = [];
 
       // Test eth_getBalance
       for (const address of TEST_ADDRESSES) {
@@ -169,42 +231,42 @@ async function runTest() {
 
         if (directBalance !== refBalance || directError || refError) {
           readsMatched = false;
+          const mismatchId = `M${++mismatchCounter}`;
           
-          // Retry reference after 5 seconds to check if mismatch persists
-          console.error(`\n⚠️  MISMATCH (balance) at block ${compareBlock} for ${address} - retrying reference in 5s...`);
-          await sleep(5000);
-          
-          let retryRefBalance: string | null = null;
-          let retryMatched = false;
-          try {
-            const retryResult = await refRpcCall("eth_getBalance", [address, compareBlockHex]);
-            retryRefBalance = String(BigInt(retryResult as string));
-            retryMatched = directBalance === retryRefBalance;
-          } catch (e) {
-            // Retry also failed
-          }
-
           const mismatch: MismatchDump = {
             timestamp: Date.now(),
             isoTime: new Date().toISOString(),
+            mismatchId,
             block: compareBlock,
             type: "balance",
             address,
             directValue: directBalance,
             referenceValue: refBalance,
-            retriedAfter5s: true,
-            retryMatched,
-            retryReferenceValue: retryRefBalance,
           };
           if (directError) mismatch.directError = directError;
           if (refError) mismatch.referenceError = refError;
           
-          mismatches.push(mismatch);
           appendData(MISMATCH_FILE, mismatch);
           
+          console.error(`\n⚠️  MISMATCH [${mismatchId}] (balance) at block ${compareBlock} for ${address}`);
           console.error(`   Direct:    ${directBalance ?? `ERROR: ${directError}`}`);
           console.error(`   Reference: ${refBalance ?? `ERROR: ${refError}`}`);
-          console.error(`   Retry:     ${retryRefBalance ?? "failed"} (${retryMatched ? "NOW MATCHES - ref hiccup" : "STILL MISMATCHED"})`);
+          
+          // Schedule non-blocking retry
+          const capturedBlockHex = compareBlockHex;
+          const capturedAddress = address;
+          scheduleRetry(
+            mismatchId,
+            compareBlock,
+            "balance",
+            address,
+            directBalance,
+            refBalance,
+            async () => {
+              const result = await refRpcCall("eth_getBalance", [capturedAddress, capturedBlockHex]);
+              return String(BigInt(result as string));
+            }
+          );
         }
       }
 
@@ -241,41 +303,41 @@ async function runTest() {
 
         if (directCallResult !== refCallResult || directError || refError) {
           readsMatched = false;
+          const mismatchId = `M${++mismatchCounter}`;
           
-          // Retry reference after 5 seconds
-          console.error(`\n⚠️  MISMATCH (eth_call) at block ${compareBlock} for Chainlink ETH/USD - retrying reference in 5s...`);
-          await sleep(5000);
-          
-          let retryRefResult: string | null = null;
-          let retryMatched = false;
-          try {
-            retryRefResult = await refRpcCall("eth_call", [callParams, compareBlockHex]) as string;
-            retryMatched = directCallResult === retryRefResult;
-          } catch (e) {
-            // Retry failed
-          }
-
           const mismatch: MismatchDump = {
             timestamp: Date.now(),
             isoTime: new Date().toISOString(),
+            mismatchId,
             block: compareBlock,
             type: "call",
             address: CHAINLINK_ETH_USD,
             directValue: directCallResult,
             referenceValue: refCallResult,
-            retriedAfter5s: true,
-            retryMatched,
-            retryReferenceValue: retryRefResult,
           };
           if (directError) mismatch.directError = directError;
           if (refError) mismatch.referenceError = refError;
           
-          mismatches.push(mismatch);
           appendData(MISMATCH_FILE, mismatch);
           
+          console.error(`\n⚠️  MISMATCH [${mismatchId}] (eth_call) at block ${compareBlock} for Chainlink ETH/USD`);
           console.error(`   Direct:    ${directCallResult?.slice(0, 66) ?? `ERROR: ${directError}`}...`);
           console.error(`   Reference: ${refCallResult?.slice(0, 66) ?? `ERROR: ${refError}`}...`);
-          console.error(`   Retry:     ${retryMatched ? "NOW MATCHES - ref hiccup" : "STILL MISMATCHED"}`);
+          
+          // Schedule non-blocking retry
+          const capturedBlockHex = compareBlockHex;
+          const capturedCallParams = { ...callParams };
+          scheduleRetry(
+            mismatchId,
+            compareBlock,
+            "call",
+            CHAINLINK_ETH_USD,
+            directCallResult,
+            refCallResult,
+            async () => {
+              return await refRpcCall("eth_call", [capturedCallParams, capturedBlockHex]) as string;
+            }
+          );
         }
       }
 

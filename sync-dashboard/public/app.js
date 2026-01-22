@@ -14,6 +14,12 @@ const latencySummaryEl = document.getElementById("latencySummary");
 const dataTableEl = document.getElementById("dataTable");
 const lastUpdatedEl = document.getElementById("lastUpdated");
 
+// Mismatch elements
+const totalMismatchesEl = document.getElementById("totalMismatches");
+const recoveredMismatchesEl = document.getElementById("recoveredMismatches");
+const persistentMismatchesEl = document.getElementById("persistentMismatches");
+const mismatchTableEl = document.getElementById("mismatchTable");
+
 function formatNumber(value, digits = 2) {
   if (value === null || value === undefined || Number.isNaN(value)) return "--";
   return Number(value).toFixed(digits);
@@ -120,6 +126,58 @@ function updateMetrics(stats) {
   latencySummaryEl.textContent = `Direct ${formatNumber(stats.latency.directAvgMs)} ms, Ref ${formatNumber(stats.latency.referenceAvgMs)} ms`;
 }
 
+function updateMismatchMetrics(mismatchStats) {
+  if (!mismatchStats) return;
+  
+  totalMismatchesEl.textContent = mismatchStats.total;
+  recoveredMismatchesEl.textContent = mismatchStats.recovered;
+  persistentMismatchesEl.textContent = mismatchStats.persistent;
+  
+  // Color coding
+  if (mismatchStats.persistent > 0) {
+    persistentMismatchesEl.style.color = "#ff6b6b";
+  } else {
+    persistentMismatchesEl.style.color = "#4fd1c5";
+  }
+  
+  // Update mismatch table
+  mismatchTableEl.innerHTML = "";
+  
+  // Build a map of recoveries
+  const recoveryMap = new Map();
+  for (const r of (mismatchStats.recoveries || [])) {
+    recoveryMap.set(r.mismatchId, r);
+  }
+  
+  const mismatches = (mismatchStats.mismatches || []).slice().reverse();
+  for (const m of mismatches) {
+    const recovery = recoveryMap.get(m.mismatchId);
+    let status = "⏳ Pending";
+    let statusClass = "";
+    
+    if (recovery) {
+      if (recovery.recovered) {
+        status = "✅ Recovered";
+        statusClass = "ok";
+      } else {
+        status = "❌ Persistent";
+        statusClass = "fail";
+      }
+    }
+    
+    const row = document.createElement("tr");
+    row.innerHTML = `
+      <td>${m.mismatchId || "--"}</td>
+      <td>${m.isoTime ? m.isoTime.slice(11, 19) : "--"}</td>
+      <td>${m.type || "--"}</td>
+      <td>${m.block || "--"}</td>
+      <td title="${m.address || ""}">${m.address ? m.address.slice(0, 10) + "..." : "--"}</td>
+      <td class="${statusClass}">${status}</td>
+    `;
+    mismatchTableEl.appendChild(row);
+  }
+}
+
 function updateCharts(points) {
   const labels = points.map((p) => p.isoTime || new Date(p.timestamp).toISOString());
   driftChart.data.labels = labels;
@@ -173,6 +231,7 @@ async function fetchStats() {
     }
     const payload = await res.json();
     updateMetrics(payload.stats);
+    updateMismatchMetrics(payload.mismatchStats);
     updateCharts(payload.points);
     updateTable(payload.points);
     lastUpdatedEl.textContent = `Last updated: ${new Date().toLocaleTimeString()}`;
