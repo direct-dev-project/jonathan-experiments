@@ -8,6 +8,7 @@ const PORT = 3000;
 const DATA_PATH = "/tmp/e2e-sync-data.ndjson";
 const MISMATCH_PATH = "/tmp/e2e-sync-data-mismatches.ndjson";
 const RECOVERY_PATH = "/tmp/e2e-sync-data-recoveries.ndjson";
+const ERROR_PATH = "/tmp/e2e-sync-data-errors.ndjson";
 
 const app = express();
 
@@ -74,7 +75,9 @@ function computeStats(points) {
       },
       speedupRatio: null,
       passCount: 0,
-      failCount: 0
+      failCount: 0,
+      totalDirectErrors: 0,
+      totalRefErrors: 0
     };
   }
 
@@ -83,6 +86,8 @@ function computeStats(points) {
   const referenceLatencies = [];
   let passCount = 0;
   let failCount = 0;
+  let totalDirectErrors = 0;
+  let totalRefErrors = 0;
 
   for (const point of points) {
     if (Number.isFinite(point.drift)) driftValues.push(point.drift);
@@ -90,6 +95,8 @@ function computeStats(points) {
     if (Number.isFinite(point.referenceLatencyMs)) referenceLatencies.push(point.referenceLatencyMs);
     if (point.readsMatched === true) passCount += 1;
     if (point.readsMatched === false) failCount += 1;
+    if (Number.isFinite(point.directErrors)) totalDirectErrors += point.directErrors;
+    if (Number.isFinite(point.refErrors)) totalRefErrors += point.refErrors;
   }
 
   const driftSorted = driftValues.slice().sort((a, b) => a - b);
@@ -127,7 +134,9 @@ function computeStats(points) {
     },
     speedupRatio,
     passCount,
-    failCount
+    failCount,
+    totalDirectErrors,
+    totalRefErrors
   };
 }
 
@@ -165,6 +174,22 @@ function computeMismatchStats(mismatches, recoveries) {
   };
 }
 
+function computeErrorStats(errors) {
+  let directErrors = 0;
+  let refErrors = 0;
+  
+  for (const e of errors) {
+    if (e.source === "direct") directErrors++;
+    if (e.source === "reference") refErrors++;
+  }
+  
+  return {
+    directErrors,
+    refErrors,
+    recentErrors: errors.slice(-20)
+  };
+}
+
 app.get("/api/stats", (req, res) => {
   fs.readFile(DATA_PATH, "utf8", (err, raw) => {
     if (err) {
@@ -193,11 +218,16 @@ app.get("/api/stats", (req, res) => {
     const mismatches = safeReadNdjson(MISMATCH_PATH);
     const recoveries = safeReadNdjson(RECOVERY_PATH);
     const mismatchStats = computeMismatchStats(mismatches, recoveries);
+    
+    // Load error data
+    const errors = safeReadNdjson(ERROR_PATH);
+    const errorStats = computeErrorStats(errors);
 
     res.json({
       points,
       stats,
-      mismatchStats
+      mismatchStats,
+      errorStats
     });
   });
 });

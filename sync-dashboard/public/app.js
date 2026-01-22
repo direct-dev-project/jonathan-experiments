@@ -20,6 +20,11 @@ const recoveredMismatchesEl = document.getElementById("recoveredMismatches");
 const persistentMismatchesEl = document.getElementById("persistentMismatches");
 const mismatchTableEl = document.getElementById("mismatchTable");
 
+// Error elements
+const directErrorsEl = document.getElementById("directErrors");
+const refErrorsEl = document.getElementById("refErrors");
+const totalSamplesEl = document.getElementById("totalSamples");
+
 function formatNumber(value, digits = 2) {
   if (value === null || value === undefined || Number.isNaN(value)) return "--";
   return Number(value).toFixed(digits);
@@ -112,7 +117,7 @@ function buildCharts() {
   });
 }
 
-function updateMetrics(stats) {
+function updateMetrics(stats, pointCount) {
   const total = stats.passCount + stats.failCount;
   const successRate = total ? stats.passCount / total : null;
 
@@ -124,10 +129,17 @@ function updateMetrics(stats) {
 
   speedupRatioEl.textContent = stats.speedupRatio ? `${formatNumber(stats.speedupRatio, 2)}x` : "--";
   latencySummaryEl.textContent = `Direct ${formatNumber(stats.latency.directAvgMs)} ms, Ref ${formatNumber(stats.latency.referenceAvgMs)} ms`;
+  
+  totalSamplesEl.textContent = pointCount;
 }
 
 function updateMismatchMetrics(mismatchStats) {
-  if (!mismatchStats) return;
+  if (!mismatchStats) {
+    totalMismatchesEl.textContent = "0";
+    recoveredMismatchesEl.textContent = "0";
+    persistentMismatchesEl.textContent = "0";
+    return;
+  }
   
   totalMismatchesEl.textContent = mismatchStats.total;
   recoveredMismatchesEl.textContent = mismatchStats.recovered;
@@ -175,6 +187,28 @@ function updateMismatchMetrics(mismatchStats) {
       <td class="${statusClass}">${status}</td>
     `;
     mismatchTableEl.appendChild(row);
+  }
+}
+
+function updateErrorMetrics(errorStats, stats) {
+  // Use accumulated errors from stats if available, otherwise from errorStats
+  const directErrs = stats.totalDirectErrors || (errorStats ? errorStats.directErrors : 0);
+  const refErrs = stats.totalRefErrors || (errorStats ? errorStats.refErrors : 0);
+  
+  directErrorsEl.textContent = directErrs;
+  refErrorsEl.textContent = refErrs;
+  
+  // Color coding
+  if (directErrs > 0) {
+    directErrorsEl.style.color = "#ff6b6b";
+  } else {
+    directErrorsEl.style.color = "#4fd1c5";
+  }
+  
+  if (refErrs > 0) {
+    refErrorsEl.style.color = "#ffb86b";
+  } else {
+    refErrorsEl.style.color = "#4fd1c5";
   }
 }
 
@@ -230,8 +264,9 @@ async function fetchStats() {
       throw new Error(err.error || `Request failed (${res.status})`);
     }
     const payload = await res.json();
-    updateMetrics(payload.stats);
+    updateMetrics(payload.stats, payload.points.length);
     updateMismatchMetrics(payload.mismatchStats);
+    updateErrorMetrics(payload.errorStats, payload.stats);
     updateCharts(payload.points);
     updateTable(payload.points);
     lastUpdatedEl.textContent = `Last updated: ${new Date().toLocaleTimeString()}`;
