@@ -11,235 +11,153 @@ const RECOVERY_PATH = "/tmp/e2e-sync-data-recoveries.ndjson";
 const ERROR_PATH = "/tmp/e2e-sync-data-errors.ndjson";
 
 const app = express();
-
 app.disable("x-powered-by");
-
-app.use(express.static(path.join(__dirname, "public"), {
-  maxAge: "1h",
-  etag: true
-}));
+app.use(express.static(path.join(__dirname, "public"), { maxAge: "1h", etag: true }));
 
 function parseNdjson(raw) {
-  const lines = raw.split(/\r?\n/);
-  const data = [];
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    try {
-      const parsed = JSON.parse(line);
-      data.push(parsed);
-    } catch (err) {
-      const error = new Error(`Invalid JSON on line ${i + 1}: ${err.message}`);
-      error.code = "PARSE_ERROR";
-      throw error;
-    }
-  }
-  return data;
+  return raw.split(/\r?\n/).filter(l => l.trim()).map(l => JSON.parse(l));
 }
 
 function safeReadNdjson(filePath) {
   try {
     if (!fs.existsSync(filePath)) return [];
-    const raw = fs.readFileSync(filePath, "utf8");
-    return parseNdjson(raw);
-  } catch (err) {
-    return [];
-  }
+    return parseNdjson(fs.readFileSync(filePath, "utf8"));
+  } catch { return []; }
 }
 
 function percentile(sorted, p) {
   if (!sorted.length) return null;
   const idx = (sorted.length - 1) * p;
-  const lo = Math.floor(idx);
-  const hi = Math.ceil(idx);
+  const lo = Math.floor(idx), hi = Math.ceil(idx);
   if (lo === hi) return sorted[lo];
-  const weight = idx - lo;
-  return sorted[lo] * (1 - weight) + sorted[hi] * weight;
+  return sorted[lo] * (1 - (idx - lo)) + sorted[hi] * (idx - lo);
 }
 
 function computeStats(points) {
-  if (!points.length) {
-    return {
-      drift: {
-        mean: null,
-        stddev: null,
-        min: null,
-        max: null,
-        p50: null,
-        p90: null,
-        p99: null
-      },
-      latency: {
-        directAvgMs: null,
-        referenceAvgMs: null
-      },
-      speedupRatio: null,
-      passCount: 0,
-      failCount: 0,
-      totalDirectErrors: 0,
-      totalRefErrors: 0
-    };
-  }
+  if (!points.length) return {
+    drift: { mean: null, stddev: null, min: null, max: null, p50: null, p90: null, p99: null },
+    latency: { directAvgMs: null, referenceAvgMs: null },
+    speedupRatio: null,
+    passCount: 0, failCount: 0,
+    totalDirectErrors: 0, totalRefErrors: 0,
+    batch: { avgLatencyMs: null, orderedRate: null, matchRate: null, avgSpeedup: null },
+    memory: { currentHeapMB: null, maxHeapMB: null, trend: null }
+  };
 
-  const driftValues = [];
-  const directLatencies = [];
-  const referenceLatencies = [];
-  let passCount = 0;
-  let failCount = 0;
-  let totalDirectErrors = 0;
-  let totalRefErrors = 0;
+  const driftValues = [], directLatencies = [], referenceLatencies = [];
+  const batchLatencies = [], batchSpeedups = [];
+  const heapValues = [];
+  let passCount = 0, failCount = 0, totalDirectErrors = 0, totalRefErrors = 0;
+  let batchOrderedCount = 0, batchMatchCount = 0, batchTotal = 0;
 
-  for (const point of points) {
-    if (Number.isFinite(point.drift)) driftValues.push(point.drift);
-    if (Number.isFinite(point.directLatencyMs)) directLatencies.push(point.directLatencyMs);
-    if (Number.isFinite(point.referenceLatencyMs)) referenceLatencies.push(point.referenceLatencyMs);
-    if (point.readsMatched === true) passCount += 1;
-    if (point.readsMatched === false) failCount += 1;
-    if (Number.isFinite(point.directErrors)) totalDirectErrors += point.directErrors;
-    if (Number.isFinite(point.refErrors)) totalRefErrors += point.refErrors;
+  for (const p of points) {
+    if (Number.isFinite(p.drift)) driftValues.push(p.drift);
+    if (Number.isFinite(p.directLatencyMs)) directLatencies.push(p.directLatencyMs);
+    if (Number.isFinite(p.referenceLatencyMs)) referenceLatencies.push(p.referenceLatencyMs);
+    if (p.readsMatched === true) passCount++;
+    if (p.readsMatched === false) failCount++;
+    if (Number.isFinite(p.directErrors)) totalDirectErrors += p.directErrors;
+    if (Number.isFinite(p.refErrors)) totalRefErrors += p.refErrors;
+    
+    // Batch stats
+    if (Number.isFinite(p.directBatchLatencyMs)) {
+      batchLatencies.push(p.directBatchLatencyMs);
+      batchTotal++;
+      if (p.directBatchOrdered) batchOrderedCount++;
+      if (p.batchMatched) batchMatchCount++;
+      if (Number.isFinite(p.batchSpeedup)) batchSpeedups.push(p.batchSpeedup);
+    }
+    
+    // Memory stats
+    if (Number.isFinite(p.heapUsedMB)) heapValues.push(p.heapUsedMB);
   }
 
   const driftSorted = driftValues.slice().sort((a, b) => a - b);
-  const driftSum = driftValues.reduce((sum, v) => sum + v, 0);
+  const driftSum = driftValues.reduce((s, v) => s + v, 0);
   const driftMean = driftValues.length ? driftSum / driftValues.length : null;
-  const driftVar = driftValues.length
-    ? driftValues.reduce((sum, v) => sum + Math.pow(v - driftMean, 2), 0) / driftValues.length
-    : null;
+  const driftVar = driftValues.length ? driftValues.reduce((s, v) => s + Math.pow(v - driftMean, 2), 0) / driftValues.length : null;
 
-  const directAvg = directLatencies.length
-    ? directLatencies.reduce((sum, v) => sum + v, 0) / directLatencies.length
-    : null;
-  const referenceAvg = referenceLatencies.length
-    ? referenceLatencies.reduce((sum, v) => sum + v, 0) / referenceLatencies.length
-    : null;
+  const directAvg = directLatencies.length ? directLatencies.reduce((s, v) => s + v, 0) / directLatencies.length : null;
+  const refAvg = referenceLatencies.length ? referenceLatencies.reduce((s, v) => s + v, 0) / referenceLatencies.length : null;
+  const speedupRatio = directAvg && refAvg ? refAvg / directAvg : null;
 
-  let speedupRatio = null;
-  if (directAvg && referenceAvg) {
-    speedupRatio = referenceAvg / directAvg;
+  // Batch aggregates
+  const batchAvgLatency = batchLatencies.length ? batchLatencies.reduce((s, v) => s + v, 0) / batchLatencies.length : null;
+  const batchAvgSpeedup = batchSpeedups.length ? batchSpeedups.reduce((s, v) => s + v, 0) / batchSpeedups.length : null;
+
+  // Memory trend (compare first 10% to last 10%)
+  let memoryTrend = null;
+  if (heapValues.length >= 20) {
+    const tenPct = Math.floor(heapValues.length * 0.1);
+    const firstAvg = heapValues.slice(0, tenPct).reduce((s, v) => s + v, 0) / tenPct;
+    const lastAvg = heapValues.slice(-tenPct).reduce((s, v) => s + v, 0) / tenPct;
+    memoryTrend = Math.round((lastAvg - firstAvg) * 100) / 100; // MB change
   }
 
   return {
     drift: {
       mean: driftMean,
       stddev: driftVar === null ? null : Math.sqrt(driftVar),
-      min: driftSorted.length ? driftSorted[0] : null,
-      max: driftSorted.length ? driftSorted[driftSorted.length - 1] : null,
+      min: driftSorted[0] ?? null,
+      max: driftSorted[driftSorted.length - 1] ?? null,
       p50: percentile(driftSorted, 0.5),
       p90: percentile(driftSorted, 0.9),
       p99: percentile(driftSorted, 0.99)
     },
-    latency: {
-      directAvgMs: directAvg,
-      referenceAvgMs: referenceAvg
-    },
+    latency: { directAvgMs: directAvg, referenceAvgMs: refAvg },
     speedupRatio,
-    passCount,
-    failCount,
-    totalDirectErrors,
-    totalRefErrors
+    passCount, failCount,
+    totalDirectErrors, totalRefErrors,
+    batch: {
+      avgLatencyMs: batchAvgLatency,
+      orderedRate: batchTotal ? batchOrderedCount / batchTotal : null,
+      matchRate: batchTotal ? batchMatchCount / batchTotal : null,
+      avgSpeedup: batchAvgSpeedup
+    },
+    memory: {
+      currentHeapMB: heapValues[heapValues.length - 1] ?? null,
+      maxHeapMB: heapValues.length ? Math.max(...heapValues) : null,
+      trend: memoryTrend
+    }
   };
 }
 
 function computeMismatchStats(mismatches, recoveries) {
-  const totalMismatches = mismatches.length;
-  
-  // Build a map of recoveries by mismatchId
-  const recoveryMap = new Map();
-  for (const r of recoveries) {
-    recoveryMap.set(r.mismatchId, r);
-  }
-  
-  let recoveredCount = 0;
-  let persistentCount = 0;
-  let pendingCount = 0;
+  const recoveryMap = new Map(recoveries.map(r => [r.mismatchId, r]));
+  let recovered = 0, persistent = 0, pending = 0;
   
   for (const m of mismatches) {
-    const recovery = recoveryMap.get(m.mismatchId);
-    if (!recovery) {
-      pendingCount++;
-    } else if (recovery.recovered) {
-      recoveredCount++;
-    } else {
-      persistentCount++;
-    }
+    const r = recoveryMap.get(m.mismatchId);
+    if (!r) pending++;
+    else if (r.recovered) recovered++;
+    else persistent++;
   }
   
   return {
-    total: totalMismatches,
-    recovered: recoveredCount,      // Reference hiccups
-    persistent: persistentCount,    // Potential Direct bugs
-    pending: pendingCount,          // Awaiting retry result
-    mismatches: mismatches.slice(-20), // Last 20 mismatches
-    recoveries: recoveries.slice(-20)  // Last 20 recoveries
-  };
-}
-
-function computeErrorStats(errors) {
-  let directErrors = 0;
-  let refErrors = 0;
-  
-  for (const e of errors) {
-    if (e.source === "direct") directErrors++;
-    if (e.source === "reference") refErrors++;
-  }
-  
-  return {
-    directErrors,
-    refErrors,
-    recentErrors: errors.slice(-20)
+    total: mismatches.length, recovered, persistent, pending,
+    mismatches: mismatches.slice(-20),
+    recoveries: recoveries.slice(-20)
   };
 }
 
 app.get("/api/stats", (req, res) => {
   fs.readFile(DATA_PATH, "utf8", (err, raw) => {
-    if (err) {
-      res.status(500).json({
-        error: "Failed to read data file",
-        details: err.message
-      });
-      return;
-    }
-
-    let points;
+    if (err) return res.status(500).json({ error: "Failed to read data" });
+    
     try {
-      points = parseNdjson(raw);
-    } catch (parseErr) {
-      res.status(500).json({
-        error: "Failed to parse data file",
-        details: parseErr.message
-      });
-      return;
+      const points = parseNdjson(raw).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      const stats = computeStats(points);
+      const mismatches = safeReadNdjson(MISMATCH_PATH);
+      const recoveries = safeReadNdjson(RECOVERY_PATH);
+      const mismatchStats = computeMismatchStats(mismatches, recoveries);
+      const errors = safeReadNdjson(ERROR_PATH);
+      
+      res.json({ points, stats, mismatchStats, errorStats: { directErrors: stats.totalDirectErrors, refErrors: stats.totalRefErrors, recentErrors: errors.slice(-20) } });
+    } catch (e) {
+      res.status(500).json({ error: "Parse error", details: e.message });
     }
-
-    points.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-    const stats = computeStats(points);
-    
-    // Load mismatch and recovery data
-    const mismatches = safeReadNdjson(MISMATCH_PATH);
-    const recoveries = safeReadNdjson(RECOVERY_PATH);
-    const mismatchStats = computeMismatchStats(mismatches, recoveries);
-    
-    // Load error data
-    const errors = safeReadNdjson(ERROR_PATH);
-    const errorStats = computeErrorStats(errors);
-
-    res.json({
-      points,
-      stats,
-      mismatchStats,
-      errorStats
-    });
   });
 });
 
-app.use((req, res) => {
-  res.status(404).json({ error: "Not found" });
-});
-
-app.use((err, req, res, next) => {
-  res.status(500).json({ error: "Server error", details: err.message });
-});
-
-app.listen(PORT, () => {
-  console.log(`Sync dashboard running on http://localhost:${PORT}`);
-});
+app.use((req, res) => res.status(404).json({ error: "Not found" }));
+app.listen(PORT, () => console.log(`Dashboard on http://localhost:${PORT}`));

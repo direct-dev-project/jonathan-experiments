@@ -8,11 +8,8 @@
  * - eth_blockNumber: block sync
  * - eth_getBalance: balance reads
  * - eth_call: Chainlink ETH/USD price feed
- * 
- * Metrics:
- * - Mismatches: Both succeeded but values differ (retry after 5s to check for ref hiccups)
- * - Direct errors: Direct failed to return a result
- * - Reference errors: Reference failed to return a result
+ * - Batch requests: ordering and performance
+ * - Memory tracking: detect leaks over time
  */
 
 import { makeDirectRPCClient } from "@direct.dev/client";
@@ -42,15 +39,17 @@ const TEST_ADDRESSES = [
 
 // Chainlink ETH/USD Price Feed on mainnet
 const CHAINLINK_ETH_USD = "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419";
-// latestRoundData() selector
 const LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c";
+
+// Additional test address for batch
+const VITALIK = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
 
 interface MismatchDump {
   timestamp: number;
   isoTime: string;
   mismatchId: string;
   block: number;
-  type: "balance" | "call";
+  type: "balance" | "call" | "batch";
   address: string;
   directValue: string;
   referenceValue: string;
@@ -61,22 +60,12 @@ interface RecoveryDump {
   isoTime: string;
   mismatchId: string;
   block: number;
-  type: "balance" | "call";
+  type: "balance" | "call" | "batch";
   address: string;
   recovered: boolean;
   directValue: string;
   originalRefValue: string;
   retryRefValue: string | null;
-}
-
-interface ErrorDump {
-  timestamp: number;
-  isoTime: string;
-  block: number;
-  type: "balance" | "call";
-  address: string;
-  source: "direct" | "reference";
-  error: string;
 }
 
 function ensureDir(filePath: string) {
@@ -94,7 +83,7 @@ function appendData(file: string, data: object) {
 let rpcId = 1;
 let mismatchCounter = 0;
 
-// Raw fetch for reference RPC (no caching)
+// Raw fetch for reference RPC - single request
 async function refRpcCall(method: string, params?: unknown[]): Promise<{ result: unknown; error?: string }> {
   try {
     const response = await fetch(REFERENCE_RPC, {
@@ -123,15 +112,41 @@ async function refRpcCall(method: string, params?: unknown[]): Promise<{ result:
   }
 }
 
+// Raw fetch for reference RPC - batch request
+async function refRpcBatch(requests: Array<{ method: string; params?: unknown[] }>): Promise<{ results: Array<{ id: number; result?: unknown; error?: string }>; error?: string }> {
+  try {
+    const batch = requests.map((req, i) => ({
+      jsonrpc: "2.0",
+      id: i + 1,
+      method: req.method,
+      params: req.params,
+    }));
+
+    const response = await fetch(REFERENCE_RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(batch),
+    });
+    
+    if (!response.ok) {
+      return { results: [], error: `HTTP ${response.status}: ${response.statusText}` };
+    }
+    
+    const json = await response.json();
+    return { results: json };
+  } catch (e) {
+    return { results: [], error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Schedule a non-blocking retry for mismatch verification
 function scheduleRetry(
   mismatchId: string,
   block: number,
-  type: "balance" | "call",
+  type: "balance" | "call" | "batch",
   address: string,
   directValue: string,
   originalRefValue: string,
@@ -171,18 +186,25 @@ function scheduleRetry(
   });
 }
 
+function getMemoryUsage() {
+  const mem = process.memoryUsage();
+  return {
+    heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024 * 100) / 100,
+    heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024 * 100) / 100,
+    rssMB: Math.round(mem.rss / 1024 / 1024 * 100) / 100,
+    externalMB: Math.round(mem.external / 1024 / 1024 * 100) / 100,
+  };
+}
+
 async function runTest() {
   console.log("Starting long-running sync test...");
   console.log(`Direct: @direct.dev/client`);
   console.log(`Reference: raw fetch to ${REFERENCE_RPC.split('/')[2]}`);
   console.log(`Data file: ${DATA_FILE}`);
-  console.log(`Mismatch file: ${MISMATCH_FILE}`);
-  console.log(`Recovery file: ${RECOVERY_FILE}`);
-  console.log(`Error file: ${ERROR_FILE}`);
-  console.log(`Tests: eth_blockNumber, eth_getBalance (${TEST_ADDRESSES.length}), eth_call (Chainlink ETH/USD)`);
+  console.log(`Tests: eth_blockNumber, eth_getBalance (${TEST_ADDRESSES.length}), eth_call, BATCH requests`);
+  console.log(`Memory tracking: enabled`);
   console.log("");
 
-  // Create Direct client using the SDK
   const directClient = makeDirectRPCClient({
     projectId: PROJECT_ID!,
     projectToken: PROJECT_TOKEN!,
@@ -197,8 +219,9 @@ async function runTest() {
   while (true) {
     try {
       const now = Date.now();
+      const memory = getMemoryUsage();
 
-      // Get block numbers with latency measurement
+      // Get block numbers
       const directStart = performance.now();
       const directBlockResponse = await directClient.fetch({ jsonrpc: "2.0", id: 1, method: "eth_blockNumber" });
       const directLatencyMs = performance.now() - directStart;
@@ -216,8 +239,6 @@ async function runTest() {
       
       const refBlock = Number(refBlockResult.result);
       const drift = directBlock - refBlock;
-
-      // Compare reads at the lower block number
       const compareBlock = Math.min(directBlock, refBlock);
       const compareBlockHex = "0x" + compareBlock.toString(16);
       
@@ -225,12 +246,10 @@ async function runTest() {
       let directErrors = 0;
       let refErrors = 0;
 
-      // Test eth_getBalance
+      // ============ INDIVIDUAL REQUESTS ============
       for (const address of TEST_ADDRESSES) {
         let directBalance: string | null = null;
         let refBalance: string | null = null;
-        let directError: string | undefined;
-        let refError: string | undefined;
 
         try {
           const response = await directClient.fetch({
@@ -241,7 +260,6 @@ async function runTest() {
           });
           directBalance = String(BigInt((response as any).result));
         } catch (e) {
-          directError = e instanceof Error ? e.message : String(e);
           directErrors++;
           appendData(ERROR_FILE, {
             timestamp: Date.now(),
@@ -250,13 +268,12 @@ async function runTest() {
             type: "balance",
             address,
             source: "direct",
-            error: directError,
+            error: e instanceof Error ? e.message : String(e),
           });
         }
 
         const refResult = await refRpcCall("eth_getBalance", [address, compareBlockHex]);
         if (refResult.error) {
-          refError = refResult.error;
           refErrors++;
           appendData(ERROR_FILE, {
             timestamp: Date.now(),
@@ -265,18 +282,16 @@ async function runTest() {
             type: "balance",
             address,
             source: "reference",
-            error: refError,
+            error: refResult.error,
           });
         } else {
           refBalance = String(BigInt(refResult.result as string));
         }
 
-        // Only count as mismatch if BOTH succeeded but values differ
         if (directBalance !== null && refBalance !== null && directBalance !== refBalance) {
           readsMatched = false;
           const mismatchId = `M${++mismatchCounter}`;
-          
-          const mismatch: MismatchDump = {
+          appendData(MISMATCH_FILE, {
             timestamp: Date.now(),
             isoTime: new Date().toISOString(),
             mismatchId,
@@ -285,128 +300,124 @@ async function runTest() {
             address,
             directValue: directBalance,
             referenceValue: refBalance,
-          };
-          
-          appendData(MISMATCH_FILE, mismatch);
-          
-          console.error(`\n⚠️  MISMATCH [${mismatchId}] (balance) at block ${compareBlock} for ${address}`);
-          console.error(`   Direct:    ${directBalance}`);
-          console.error(`   Reference: ${refBalance}`);
-          
-          // Schedule non-blocking retry
-          const capturedBlockHex = compareBlockHex;
-          const capturedAddress = address;
-          const capturedRefBalance = refBalance;
-          scheduleRetry(
-            mismatchId,
-            compareBlock,
-            "balance",
-            address,
-            directBalance,
-            capturedRefBalance,
-            async () => {
-              const result = await refRpcCall("eth_getBalance", [capturedAddress, capturedBlockHex]);
-              if (result.error) return null;
-              return String(BigInt(result.result as string));
-            }
-          );
+          });
+          console.error(`\n⚠️  MISMATCH [${mismatchId}] balance at block ${compareBlock}`);
         }
       }
 
-      // Test eth_call (Chainlink ETH/USD latestRoundData)
-      {
-        let directCallResult: string | null = null;
-        let refCallResult: string | null = null;
-        let directError: string | undefined;
-        let refError: string | undefined;
+      // eth_call test
+      const callParams = { to: CHAINLINK_ETH_USD, data: LATEST_ROUND_DATA_SELECTOR };
+      let directCallResult: string | null = null;
+      let refCallResult: string | null = null;
 
-        const callParams = {
-          to: CHAINLINK_ETH_USD,
-          data: LATEST_ROUND_DATA_SELECTOR,
-        };
+      try {
+        const response = await directClient.fetch({
+          jsonrpc: "2.0",
+          id: Date.now(),
+          method: "eth_call",
+          params: [callParams, compareBlockHex],
+        });
+        directCallResult = (response as any).result;
+      } catch (e) {
+        directErrors++;
+      }
 
-        try {
-          const response = await directClient.fetch({
-            jsonrpc: "2.0",
-            id: Date.now(),
-            method: "eth_call",
-            params: [callParams, compareBlockHex],
-          });
-          directCallResult = (response as any).result;
-        } catch (e) {
-          directError = e instanceof Error ? e.message : String(e);
-          directErrors++;
-          appendData(ERROR_FILE, {
-            timestamp: Date.now(),
-            isoTime: new Date().toISOString(),
-            block: compareBlock,
-            type: "call",
-            address: CHAINLINK_ETH_USD,
-            source: "direct",
-            error: directError,
-          });
+      const refCallRes = await refRpcCall("eth_call", [callParams, compareBlockHex]);
+      if (!refCallRes.error) {
+        refCallResult = refCallRes.result as string;
+      } else {
+        refErrors++;
+      }
+
+      if (directCallResult && refCallResult && directCallResult !== refCallResult) {
+        readsMatched = false;
+      }
+
+      // ============ BATCH REQUEST TEST ============
+      // Build batch: 5 requests with known IDs
+      const batchRequests = [
+        { method: "eth_blockNumber", params: [] },
+        { method: "eth_getBalance", params: [TEST_ADDRESSES[0], compareBlockHex] },
+        { method: "eth_getBalance", params: [VITALIK, compareBlockHex] },
+        { method: "eth_call", params: [callParams, compareBlockHex] },
+        { method: "eth_getBalance", params: [TEST_ADDRESSES[1], compareBlockHex] },
+      ];
+
+      // Direct batch
+      const directBatchStart = performance.now();
+      let directBatchResults: any[] = [];
+      let directBatchOrdered = true;
+      let directBatchError = false;
+      
+      try {
+        const batchPayload = batchRequests.map((req, i) => ({
+          jsonrpc: "2.0",
+          id: i + 1,
+          method: req.method,
+          params: req.params,
+        }));
+        
+        const batchResponse = await directClient.fetch(batchPayload as any);
+        directBatchResults = Array.isArray(batchResponse) ? batchResponse : [batchResponse];
+        
+        // Check ordering: response[i].id should equal i+1
+        for (let i = 0; i < directBatchResults.length; i++) {
+          if (directBatchResults[i]?.id !== i + 1) {
+            directBatchOrdered = false;
+            break;
+          }
         }
+      } catch (e) {
+        directBatchError = true;
+        directErrors++;
+      }
+      const directBatchLatencyMs = performance.now() - directBatchStart;
 
-        const refResult = await refRpcCall("eth_call", [callParams, compareBlockHex]);
-        if (refResult.error) {
-          refError = refResult.error;
-          refErrors++;
-          appendData(ERROR_FILE, {
-            timestamp: Date.now(),
-            isoTime: new Date().toISOString(),
-            block: compareBlock,
-            type: "call",
-            address: CHAINLINK_ETH_USD,
-            source: "reference",
-            error: refError,
-          });
-        } else {
-          refCallResult = refResult.result as string;
-        }
-
-        // Only count as mismatch if BOTH succeeded but values differ
-        if (directCallResult !== null && refCallResult !== null && directCallResult !== refCallResult) {
-          readsMatched = false;
-          const mismatchId = `M${++mismatchCounter}`;
-          
-          const mismatch: MismatchDump = {
-            timestamp: Date.now(),
-            isoTime: new Date().toISOString(),
-            mismatchId,
-            block: compareBlock,
-            type: "call",
-            address: CHAINLINK_ETH_USD,
-            directValue: directCallResult,
-            referenceValue: refCallResult,
-          };
-          
-          appendData(MISMATCH_FILE, mismatch);
-          
-          console.error(`\n⚠️  MISMATCH [${mismatchId}] (eth_call) at block ${compareBlock} for Chainlink ETH/USD`);
-          console.error(`   Direct:    ${directCallResult.slice(0, 66)}...`);
-          console.error(`   Reference: ${refCallResult.slice(0, 66)}...`);
-          
-          // Schedule non-blocking retry
-          const capturedBlockHex = compareBlockHex;
-          const capturedCallParams = { ...callParams };
-          const capturedRefResult = refCallResult;
-          scheduleRetry(
-            mismatchId,
-            compareBlock,
-            "call",
-            CHAINLINK_ETH_USD,
-            directCallResult,
-            capturedRefResult,
-            async () => {
-              const result = await refRpcCall("eth_call", [capturedCallParams, capturedBlockHex]);
-              if (result.error) return null;
-              return result.result as string;
-            }
-          );
+      // Reference batch
+      const refBatchStart = performance.now();
+      const refBatchResult = await refRpcBatch(batchRequests);
+      const refBatchLatencyMs = performance.now() - refBatchStart;
+      
+      let refBatchOrdered = true;
+      let refBatchError = !!refBatchResult.error;
+      
+      if (!refBatchError && refBatchResult.results.length > 0) {
+        for (let i = 0; i < refBatchResult.results.length; i++) {
+          if (refBatchResult.results[i]?.id !== i + 1) {
+            refBatchOrdered = false;
+            break;
+          }
         }
       }
 
-      // Calculate block deltas
+      // Batch comparison - check if results match
+      let batchMatched = true;
+      if (!directBatchError && !refBatchError && directBatchResults.length === refBatchResult.results.length) {
+        for (let i = 0; i < directBatchResults.length; i++) {
+          const dRes = directBatchResults[i]?.result;
+          const rRes = refBatchResult.results[i]?.result;
+          if (dRes !== rRes) {
+            batchMatched = false;
+            break;
+          }
+        }
+      } else if (directBatchError || refBatchError) {
+        batchMatched = true; // Don't count errors as mismatches
+      } else {
+        batchMatched = false;
+      }
+
+      if (!batchMatched && !directBatchError && !refBatchError) {
+        readsMatched = false;
+      }
+
+      // Calculate batch speedup (vs sequential)
+      // Estimate sequential time as 5x single request average
+      const avgSingleLatency = (directLatencyMs + refLatencyMs) / 2;
+      const estimatedSequentialMs = avgSingleLatency * 5;
+      const batchSpeedup = estimatedSequentialMs / directBatchLatencyMs;
+
+      // Block deltas
       let directBlockDeltaMs: number | null = null;
       let refBlockDeltaMs: number | null = null;
       let directBlockJump = 0;
@@ -414,16 +425,11 @@ async function runTest() {
 
       if (lastDirectBlock !== null && lastDirectTime !== null) {
         directBlockJump = directBlock - lastDirectBlock;
-        if (directBlockJump > 0) {
-          directBlockDeltaMs = now - lastDirectTime;
-        }
+        if (directBlockJump > 0) directBlockDeltaMs = now - lastDirectTime;
       }
-
       if (lastRefBlock !== null && lastRefTime !== null) {
         refBlockJump = refBlock - lastRefBlock;
-        if (refBlockJump > 0) {
-          refBlockDeltaMs = now - lastRefTime;
-        }
+        if (refBlockJump > 0) refBlockDeltaMs = now - lastRefTime;
       }
 
       const dataPoint = {
@@ -435,9 +441,20 @@ async function runTest() {
         directLatencyMs,
         referenceLatencyMs: refLatencyMs,
         readsMatched,
-        readCount: TEST_ADDRESSES.length + 1, // +1 for eth_call
+        readCount: TEST_ADDRESSES.length + 1,
         directErrors,
         refErrors,
+        // Batch metrics
+        batchSize: batchRequests.length,
+        directBatchLatencyMs,
+        refBatchLatencyMs,
+        directBatchOrdered,
+        refBatchOrdered,
+        batchMatched,
+        batchSpeedup: Math.round(batchSpeedup * 100) / 100,
+        // Memory metrics
+        ...memory,
+        // Block deltas
         directBlockDeltaMs,
         refBlockDeltaMs,
         directBlockJump,
@@ -446,7 +463,6 @@ async function runTest() {
 
       appendData(DATA_FILE, dataPoint);
 
-      // Update last values
       if (directBlock !== lastDirectBlock) {
         lastDirectBlock = directBlock;
         lastDirectTime = now;
@@ -458,15 +474,15 @@ async function runTest() {
 
       // Status output
       const status = readsMatched ? "✓" : "✗";
-      const errorInfo = (directErrors || refErrors) ? ` | Errs: D${directErrors}/R${refErrors}` : "";
+      const batchStatus = directBatchOrdered && batchMatched ? "✓" : "✗";
       process.stdout.write(
-        `\r[${new Date().toISOString()}] Direct: ${directBlock} | Ref: ${refBlock} | Drift: ${drift} | Reads: ${status}${errorInfo} | Direct: ${directLatencyMs.toFixed(2)}ms | Ref: ${refLatencyMs.toFixed(2)}ms    `
+        `\r[${new Date().toISOString()}] Blk:${directBlock} Drift:${drift} Reads:${status} Batch:${batchStatus} D:${directLatencyMs.toFixed(1)}ms R:${refLatencyMs.toFixed(1)}ms Mem:${memory.heapUsedMB}MB    `
       );
 
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await sleep(500);
     } catch (error) {
-      console.error("\nError during test iteration:", error);
-      await new Promise((resolve) => setTimeout(resolve, 5000));
+      console.error("\nError:", error);
+      await sleep(5000);
     }
   }
 }
