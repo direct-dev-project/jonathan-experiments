@@ -27,7 +27,7 @@ if (!PROJECT_ID || !PROJECT_TOKEN) {
   process.exit(1);
 }
 
-const REFERENCE_RPC = "https://ethereum-rpc.publicnode.com";
+const REFERENCE_RPC = "https://twilight-fragrant-sailboat.quiknode.pro/2d2793cc22ab621897fcfb2f365960f0ff2d8daf";
 const DATA_FILE = process.env.DATA_FILE || "/tmp/e2e-sync-data.ndjson";
 const MISMATCH_FILE = DATA_FILE.replace(/\.ndjson$/, "-mismatches.ndjson");
 const RECOVERY_FILE = DATA_FILE.replace(/\.ndjson$/, "-recoveries.ndjson");
