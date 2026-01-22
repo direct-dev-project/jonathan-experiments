@@ -1,0 +1,13 @@
+{
+  "name": "sync-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Real-time sync test dashboard for Direct.dev",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Direct.dev Sync Dashboard</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <div class="app">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Direct.dev</p>
+          <h1>Real-time Sync Test Dashboard</h1>
+          <p class="subtitle">Tracking drift, latency, and read parity across sync runs.</p>
+        </div>
+        <div class="status" id="statusBadge">Live</div>
+      </header>
+
+      <section class="metrics">
+        <div class="metric-card">
+          <p class="metric-label">Success Rate</p>
+          <div class="metric-value" id="successRate">--</div>
+          <p class="metric-sub" id="passFail">--</p>
+        </div>
+        <div class="metric-card">
+          <p class="metric-label">Drift (mean / p90)</p>
+          <div class="metric-value" id="driftSummary">--</div>
+          <p class="metric-sub" id="driftRange">--</p>
+        </div>
+        <div class="metric-card">
+          <p class="metric-label">Latency Speedup</p>
+          <div class="metric-value" id="speedupRatio">--</div>
+          <p class="metric-sub" id="latencySummary">--</p>
+        </div>
+      </section>
+
+      <section class="charts">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Drift Over Time</h2>
+            <p>Block height delta across sync points.</p>
+          </div>
+          <canvas id="driftChart"></canvas>
+        </div>
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Latency Comparison</h2>
+            <p>Direct vs reference latency in milliseconds.</p>
+          </div>
+          <canvas id="latencyChart"></canvas>
+        </div>
+      </section>
+
+      <section class="table-panel">
+        <div class="panel-header">
+          <h2>Recent Sync Samples</h2>
+          <p>Latest data points from the NDJSON feed.</p>
+        </div>
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Drift</th>
+                <th>Direct Latency (ms)</th>
+                <th>Reference Latency (ms)</th>
+                <th>Reads Matched</th>
+                <th>Read Count</th>
+              </tr>
+            </thead>
+            <tbody id="dataTable"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <footer>
+        <span id="lastUpdated">Waiting for data...</span>
+      </footer>
+    </div>
+  </body>
+</html>
